@@ -64,8 +64,10 @@ fun PanelCard(
         stale -> CosmosAmber
         else -> CosmosGreen
     }
+    // Null means the response carried no measured_at — the age is UNKNOWN.
+    // Never substitute the client clock (consistency with cDeck).
     val ageText = if (measuredAtMs == null) {
-        "no data"
+        "age UNKNOWN"
     } else {
         "measured ${humanAge(nowMs - measuredAtMs)} ago"
     }

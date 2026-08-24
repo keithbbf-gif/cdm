@@ -36,12 +36,18 @@ object CosmosClient {
     fun getEvents(baseUrl: String, token: String, sinceSeq: Long): JSONObject =
         request("GET", url(baseUrl, "/api/v1/events?since_seq=$sinceSeq"), token, null)
 
-    fun postCommand(baseUrl: String, token: String, text: String): JSONObject =
+    /**
+     * [requestId] is a client-generated idempotency key. It rides in the body
+     * (`request_id`) and as `X-Request-Id`, so a timeout-then-retry of the
+     * same command can be deduplicated server-side instead of double-executed.
+     */
+    fun postCommand(baseUrl: String, token: String, text: String, requestId: String): JSONObject =
         request(
             "POST",
             url(baseUrl, "/api/v1/command"),
             token,
-            JSONObject().put("text", text),
+            JSONObject().put("text", text).put("request_id", requestId),
+            requestId = requestId,
         )
 
     private fun url(baseUrl: String, path: String): String =
@@ -52,6 +58,7 @@ object CosmosClient {
         urlStr: String,
         token: String,
         body: JSONObject?,
+        requestId: String? = null,
     ): JSONObject {
         var conn: HttpURLConnection? = null
         return try {
@@ -62,6 +69,9 @@ object CosmosClient {
             conn.readTimeout = if (method == "POST") 30_000 else 12_000
             conn.useCaches = false
             conn.setRequestProperty("Accept", "application/json")
+            if (requestId != null) {
+                conn.setRequestProperty("X-Request-Id", requestId)
+            }
             if (token.isNotBlank()) {
                 conn.setRequestProperty("Authorization", "Bearer $token")
             }

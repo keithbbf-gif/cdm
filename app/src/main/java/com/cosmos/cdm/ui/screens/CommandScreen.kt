@@ -53,6 +53,10 @@ fun CommandScreen(vm: CdmViewModel, modifier: Modifier = Modifier) {
     var text by remember { mutableStateOf("") }
 
     fun send() {
+        // UI-level courtesy only — the authoritative guard is the atomic
+        // busy CAS in CdmViewModel.runCommand. This just keeps the typed
+        // text from being cleared when a submit races a running command.
+        if (busy) return
         val t = text
         text = ""
         vm.runCommand(t)

@@ -61,6 +61,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.2")
+    // ProcessLifecycleOwner — pauses polling while the app is backgrounded.
+    implementation("androidx.lifecycle:lifecycle-process:2.8.2")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")

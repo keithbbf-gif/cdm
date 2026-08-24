@@ -1,9 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- COSMOS is HTTP on LAN / Tailscale (encrypted in the tailnet). Cleartext is deliberate. -->
+<!--
+  COSMOS is HTTP on LAN / Tailscale (encrypted in the tailnet). Cleartext is
+  deliberate, but SCOPED: only the known COSMOS hosts may speak http. Every
+  other destination requires TLS (base-config denies cleartext). Keep the
+  domain list in sync with SettingsStore.LAN_URL / TAILSCALE_URL.
+-->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true">
+    <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
+    <!-- LAN preset (SettingsStore.LAN_URL) -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.10</domain>
+        <!-- Tailscale preset / default (SettingsStore.TAILSCALE_URL) -->
+        <domain includeSubdomains="false">100.103.9.112</domain>
+    </domain-config>
 </network-security-config>

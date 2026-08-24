@@ -58,7 +58,7 @@ fun CdmApp(vm: CdmViewModel) {
     val connColor = when (conn.kind) {
         ConnKind.Connected -> CosmosGreen
         ConnKind.Offline, ConnKind.Unauthorized -> CosmosRed
-        ConnKind.Connecting -> CosmosAmber
+        ConnKind.Partial, ConnKind.Connecting -> CosmosAmber
         ConnKind.Idle -> CosmosInkFaint
     }
 
@@ -92,6 +92,7 @@ fun CdmApp(vm: CdmViewModel) {
                 Text(
                     when (conn.kind) {
                         ConnKind.Connected -> "LIVE"
+                        ConnKind.Partial -> "PARTIAL"
                         ConnKind.Offline -> "OFFLINE"
                         ConnKind.Unauthorized -> "AUTH"
                         ConnKind.Connecting -> "…"

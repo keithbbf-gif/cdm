@@ -9,7 +9,7 @@ data class Panel<T>(
     val error: String? = null,
 )
 
-enum class ConnKind { Idle, Connecting, Connected, Offline, Unauthorized }
+enum class ConnKind { Idle, Connecting, Connected, Partial, Offline, Unauthorized }
 
 data class ConnState(
     val kind: ConnKind = ConnKind.Idle,
@@ -74,6 +74,10 @@ data class LedgerEvent(
     val event: String,
     val writer: String,
     val tMs: Long?,
+    // Client-side monotonic id assigned when the event is appended to the feed.
+    // Stable and unique even when seq is null — the LazyColumn key. (seq alone
+    // is not usable: null seqs collapsed onto hashCode(), which collides.)
+    val localId: Long = 0L,
 )
 
 data class CommandEntry(
@@ -102,12 +106,18 @@ fun JSONObject.optBoolOrNull(key: String): Boolean? {
 
 fun toEpochMs(v: Double): Long = if (v > 1e12) v.toLong() else (v * 1000.0).toLong()
 
-fun extractMeasuredAtMs(obj: JSONObject, fallbackMs: Long = System.currentTimeMillis()): Long {
+/**
+ * The server's own measurement time, or null when the response does not carry
+ * one. Null means age UNKNOWN — never substitute the client clock, which would
+ * report a fresh-looking age for data the server never timestamped (same rule
+ * as cDeck).
+ */
+fun extractMeasuredAtMs(obj: JSONObject): Long? {
     for (key in listOf("measured_at_epoch", "measured_at", "served_at")) {
         val v = obj.optDoubleOrNull(key) ?: continue
         return toEpochMs(v)
     }
-    return fallbackMs
+    return null
 }
 
 fun parseStatus(obj: JSONObject): StatusSnapshot {

@@ -40,7 +40,7 @@ fun SettingsScreen(vm: CdmViewModel, modifier: Modifier = Modifier) {
     val connColor = when (conn.kind) {
         ConnKind.Connected -> CosmosGreen
         ConnKind.Offline, ConnKind.Unauthorized -> CosmosRed
-        ConnKind.Connecting -> CosmosAmber
+        ConnKind.Partial, ConnKind.Connecting -> CosmosAmber
         ConnKind.Idle -> CosmosInkFaint
     }
 

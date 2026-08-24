@@ -122,7 +122,10 @@ fun DashboardScreen(vm: CdmViewModel, modifier: Modifier = Modifier) {
                 }
             }
         }
-        items(events.data.orEmpty(), key = { ev -> ev.seq ?: ev.hashCode().toLong() }) { ev ->
+        // localId is assigned once per appended event in the VM — stable and
+        // unique even when seq is null (seq ?: hashCode collided on
+        // identical null-seq rows).
+        items(events.data.orEmpty(), key = { ev -> ev.localId }) { ev ->
             EventRow(ev, nowMs)
         }
         item { Spacer(Modifier.height(12.dp)) }

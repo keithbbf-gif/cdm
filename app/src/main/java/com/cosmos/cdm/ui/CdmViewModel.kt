@@ -2,6 +2,9 @@ package com.cosmos.cdm.ui
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.cosmos.cdm.data.CommandEntry
 import com.cosmos.cdm.data.ConnKind
@@ -31,6 +34,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -38,9 +42,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
 
 private const val SNAPSHOT_MS = 10_000L
 private const val EVENTS_MS = 5_000L
+private const val BACKOFF_CAP_MS = 60_000L
+private const val BACKOFF_MAX_SHIFT = 4
+private const val JITTER_MS = 1_000L
 private const val CONSOLE_MAX = 50
 private const val FEED_MAX = 200
 
@@ -89,10 +99,29 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
 
     private var loops: Job? = null
     private var lastSeq: Long = 0L
+    private var eventCounter: Long = 0L
     private val eventsLock = Mutex()
     private val snapshotLock = Mutex()
 
+    // Bumped on every connect()/disconnect(). An in-flight request captured an
+    // older generation (old URL); its result is dropped instead of updating the
+    // new connection's panels/state.
+    private val generation = AtomicInteger(0)
+
+    // True while any activity of the app is started. Poll loops suspend on
+    // false (repeatOnLifecycle-equivalent gate) so a backgrounded app stops
+    // hitting the network and draining battery; polling resumes on foreground.
+    private val _foreground = MutableStateFlow(true)
+    private val lifecycleObserver = LifecycleEventObserver { _, event ->
+        when (event) {
+            Lifecycle.Event.ON_START -> _foreground.value = true
+            Lifecycle.Event.ON_STOP -> _foreground.value = false
+            else -> Unit
+        }
+    }
+
     init {
+        ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycleObserver)
         viewModelScope.launch {
             while (true) {
                 delay(1_000)
@@ -102,6 +131,11 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
         // URL is persisted; start polling so the dashboard is live on launch.
         // Bearer is empty until pasted — --no-auth kernels work immediately.
         connect()
+    }
+
+    override fun onCleared() {
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
+        super.onCleared()
     }
 
     fun setServerUrl(url: String) {
@@ -130,6 +164,9 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
         store.setServerUrl(url)
         _serverUrl.value = url
         activeUrl = url
+        // New generation: results still in flight against the old URL must not
+        // land on this connection's panels.
+        generation.incrementAndGet()
         if (url != prev) resetFeed()
         _conn.value = ConnState(ConnKind.Connecting, "connecting…", url)
         startLoops()
@@ -138,6 +175,7 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect() {
         loops?.cancel()
         loops = null
+        generation.incrementAndGet()
         _conn.value = ConnState(ConnKind.Idle, "not connected", _serverUrl.value)
     }
 
@@ -148,12 +186,28 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
             pushCommand(CommandEntry.Kind.ERR, "NOT CONNECTED", "connect to the API before running commands")
             return
         }
+        // Wire-level busy guard: atomically claim the flag BEFORE anything is
+        // sent. The UI disables its button, but IME "Go" and racing taps reach
+        // this path while a command is in flight — the CAS is the real gate.
+        if (!_commandBusy.compareAndSet(false, true)) {
+            pushCommand(CommandEntry.Kind.ERR, "BUSY", "a command is already running — wait for it to finish")
+            return
+        }
+        // Idempotency key: rides as request_id/X-Request-Id so a
+        // timeout-then-retry cannot double-execute server-side.
+        val requestId = UUID.randomUUID().toString()
+        val gen = generation.get()
         pushCommand(CommandEntry.Kind.CMD, "", "> $t")
         viewModelScope.launch {
-            _commandBusy.value = true
             try {
                 val json = withContext(Dispatchers.IO) {
-                    CosmosClient.postCommand(activeUrl, _bearer.value, t)
+                    CosmosClient.postCommand(activeUrl, _bearer.value, t, requestId)
+                }
+                if (gen != generation.get()) {
+                    // URL changed while in flight — result belongs to the old
+                    // connection; don't report it as the new one's.
+                    pushCommand(CommandEntry.Kind.ERR, "STALE", "connection changed while the command was in flight")
+                    return@launch
                 }
                 when (classify(json)) {
                     ResultKind.Offline ->
@@ -187,22 +241,36 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
     private fun startLoops() {
         loops?.cancel()
         loops = viewModelScope.launch {
-            refreshSnapshots()
-            pollEvents()
             val snap = launch {
+                var failures = 0
                 while (true) {
-                    delay(SNAPSHOT_MS)
-                    refreshSnapshots()
+                    _foreground.first { it } // suspend while backgrounded
+                    val ok = refreshSnapshots()
+                    failures = if (ok) 0 else minOf(failures + 1, BACKOFF_MAX_SHIFT)
+                    delay(backoffDelay(SNAPSHOT_MS, failures))
                 }
             }
             val ev = launch {
+                var failures = 0
                 while (true) {
-                    delay(EVENTS_MS)
-                    pollEvents()
+                    _foreground.first { it }
+                    val ok = pollEvents()
+                    failures = if (ok) 0 else minOf(failures + 1, BACKOFF_MAX_SHIFT)
+                    delay(backoffDelay(EVENTS_MS, failures))
                 }
             }
             joinAll(snap, ev)
         }
+    }
+
+    /**
+     * Base interval on success; exponential (base * 2^failures) on consecutive
+     * failures, capped at [BACKOFF_CAP_MS]; plus 0..[JITTER_MS) of jitter so
+     * retries from multiple clients don't synchronize.
+     */
+    private fun backoffDelay(baseMs: Long, failures: Int): Long {
+        val backed = if (failures <= 0) baseMs else minOf(baseMs shl failures, BACKOFF_CAP_MS)
+        return backed + Random.nextLong(JITTER_MS)
     }
 
     private fun resetFeed() {
@@ -210,56 +278,71 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
         _events.value = Panel(data = emptyList())
     }
 
-    private suspend fun refreshSnapshots() {
-        snapshotLock.withLock {
-            val url = activeUrl
-            val token = _bearer.value
-            val t0 = System.currentTimeMillis()
-            val kinds = coroutineScope {
-                val s = async { fetch(_status, ::parseStatus) { CosmosClient.getStatus(url, token) } }
-                val h = async { fetch(_health, ::parseHealth) { CosmosClient.getHealth(url, token) } }
-                val p = async { fetch(_spend, ::parseSpend) { CosmosClient.getSpend(url, token) } }
-                val j = async { fetch(_jobs, ::parseJobs) { CosmosClient.getJobs(url, token) } }
-                val m = async { fetch(_makers, ::parseMakers) { CosmosClient.getMakers(url, token) } }
-                listOf(s.await(), h.await(), p.await(), j.await(), m.await())
-            }
-            val rtt = System.currentTimeMillis() - t0
-            _conn.value = summarize(kinds, url, rtt)
+    /** Returns true when the critical pair (status + health) both answered OK. */
+    private suspend fun refreshSnapshots(): Boolean = snapshotLock.withLock {
+        val gen = generation.get()
+        val url = activeUrl
+        val token = _bearer.value
+        val t0 = System.currentTimeMillis()
+        // Order matters: [0]=status, [1]=health are the critical pair.
+        val kinds = coroutineScope {
+            val s = async { fetch(gen, _status, ::parseStatus) { CosmosClient.getStatus(url, token) } }
+            val h = async { fetch(gen, _health, ::parseHealth) { CosmosClient.getHealth(url, token) } }
+            val p = async { fetch(gen, _spend, ::parseSpend) { CosmosClient.getSpend(url, token) } }
+            val j = async { fetch(gen, _jobs, ::parseJobs) { CosmosClient.getJobs(url, token) } }
+            val m = async { fetch(gen, _makers, ::parseMakers) { CosmosClient.getMakers(url, token) } }
+            listOf(s.await(), h.await(), p.await(), j.await(), m.await())
         }
+        val criticalOk = kinds[0] == ResultKind.Ok && kinds[1] == ResultKind.Ok
+        // Stale generation (URL changed mid-flight): never touch the new
+        // connection's headline state.
+        if (gen != generation.get()) return@withLock criticalOk
+        val rtt = System.currentTimeMillis() - t0
+        _conn.value = summarize(kinds, url, rtt)
+        criticalOk
     }
 
-    private suspend fun pollEvents() {
-        eventsLock.withLock {
-            val url = activeUrl
-            val token = _bearer.value
-            val json = withContext(Dispatchers.IO) { CosmosClient.getEvents(url, token, lastSeq) }
-            when (classify(json)) {
-                ResultKind.Offline -> _events.update { it.copy(error = "offline") }
-                ResultKind.Unauthorized -> _events.update {
-                    it.copy(error = "UNAUTHORIZED — paste a bearer in Settings")
-                }
-                ResultKind.HttpError -> _events.update {
-                    it.copy(error = errorMessage(json))
-                }
-                ResultKind.Ok -> {
-                    val (head, incoming) = parseEvents(json)
-                    if (head != null && head < lastSeq) {
-                        lastSeq = 0L
-                        _events.value = Panel(data = emptyList(), measuredAtMs = System.currentTimeMillis())
-                        val again = withContext(Dispatchers.IO) { CosmosClient.getEvents(url, token, 0) }
-                        if (classify(again) == ResultKind.Ok) {
-                            applyEvents(again)
-                        }
-                        return@withLock
+    /** Returns true when the events endpoint answered OK. */
+    private suspend fun pollEvents(): Boolean = eventsLock.withLock {
+        val gen = generation.get()
+        val url = activeUrl
+        val token = _bearer.value
+        val json = withContext(Dispatchers.IO) { CosmosClient.getEvents(url, token, lastSeq) }
+        // Stale generation: drop the result — it was fetched from the old URL.
+        if (gen != generation.get()) return@withLock false
+        when (classify(json)) {
+            ResultKind.Offline -> {
+                _events.update { it.copy(error = "offline") }
+                false
+            }
+            ResultKind.Unauthorized -> {
+                _events.update { it.copy(error = "UNAUTHORIZED — paste a bearer in Settings") }
+                false
+            }
+            ResultKind.HttpError -> {
+                _events.update { it.copy(error = errorMessage(json)) }
+                false
+            }
+            ResultKind.Ok -> {
+                val (head, incoming) = parseEvents(json)
+                if (head != null && head < lastSeq) {
+                    lastSeq = 0L
+                    _events.value = Panel(data = emptyList(), measuredAtMs = null)
+                    val again = withContext(Dispatchers.IO) { CosmosClient.getEvents(url, token, 0) }
+                    if (gen == generation.get() && classify(again) == ResultKind.Ok) {
+                        applyEvents(again)
                     }
-                    applyEvents(json, incoming)
+                    return@withLock true
                 }
+                applyEvents(json, incoming)
+                true
             }
         }
     }
 
     private fun applyEvents(json: JSONObject, incoming: List<LedgerEvent> = parseEvents(json).second) {
-        val now = System.currentTimeMillis()
+        // Server's own timestamp or null (age UNKNOWN) — never the client clock.
+        val measured = extractMeasuredAtMs(json)
         _events.update { cur ->
             val existing = cur.data.orEmpty()
             val next = existing.toMutableList()
@@ -267,20 +350,26 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
                 val seq = ev.seq
                 if (seq != null && seq <= lastSeq) continue
                 if (seq != null && seq > lastSeq) lastSeq = seq
-                next.add(ev)
+                // localId is the stable LazyColumn key — unique even when seq
+                // is null, where hashCode() collided on identical rows.
+                next.add(ev.copy(localId = ++eventCounter))
             }
             while (next.size > FEED_MAX) next.removeAt(0)
-            Panel(data = next, measuredAtMs = now, error = null)
+            Panel(data = next, measuredAtMs = measured, error = null)
         }
     }
 
     private suspend fun <T> fetch(
+        gen: Int,
         dest: MutableStateFlow<Panel<T>>,
         parse: (JSONObject) -> T,
         call: () -> JSONObject,
     ): ResultKind {
         val json = withContext(Dispatchers.IO) { call() }
         val kind = classify(json)
+        // Result from an older generation (URL changed while the request was
+        // in flight) must not update the new connection's panel.
+        if (gen != generation.get()) return kind
         when (kind) {
             ResultKind.Offline -> dest.update { it.copy(error = "offline") }
             ResultKind.Unauthorized -> dest.update {
@@ -296,21 +385,36 @@ class CdmViewModel(app: Application) : AndroidViewModel(app) {
         return kind
     }
 
+    /**
+     * [kinds] order: [status, health, spend, jobs, makers]. The headline must
+     * reflect reality: LIVE (Connected) requires the critical pair (status AND
+     * health) OK with nothing failing. Critical pair OK but panels failing →
+     * PARTIAL. Something answers but the critical pair doesn't → DEGRADED.
+     * One lucky endpoint out of five is never "LIVE".
+     */
     private fun summarize(kinds: List<ResultKind>, url: String, rtt: Long): ConnState {
         if (kinds.any { it == ResultKind.Unauthorized }) {
             return ConnState(ConnKind.Unauthorized, "UNAUTHORIZED — paste a bearer", url)
         }
-        val allBad = kinds.isNotEmpty() && kinds.all { it != ResultKind.Ok }
-        val anyOk = kinds.any { it == ResultKind.Ok }
+        val okCount = kinds.count { it == ResultKind.Ok }
+        val failing = kinds.size - okCount
+        val criticalOk = kinds.size >= 2 &&
+            kinds[0] == ResultKind.Ok && kinds[1] == ResultKind.Ok
         return when {
-            allBad && kinds.any { it == ResultKind.Offline } ->
+            okCount == 0 && kinds.any { it == ResultKind.Offline } ->
                 ConnState(ConnKind.Offline, "offline — COSMOS is not answering", url)
-            allBad ->
+            okCount == 0 ->
                 ConnState(ConnKind.Offline, "SERVER DOWN", url)
-            anyOk ->
+            criticalOk && failing == 0 ->
                 ConnState(ConnKind.Connected, "connected · $url · rtt ${rtt}ms", url)
+            criticalOk ->
+                ConnState(ConnKind.Partial, "PARTIAL — $failing/${kinds.size} panels failing", url)
             else ->
-                ConnState(ConnKind.Connecting, "connecting…", url)
+                ConnState(
+                    ConnKind.Partial,
+                    "DEGRADED — status/health failing · $okCount/${kinds.size} panels ok",
+                    url,
+                )
         }
     }
 
