@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- four glanceable panels — cDm is a dashboard, not a voice mic -->
+    <path
+        android:fillColor="#56B6C2"
+        android:pathData="M28,28h22v22h-22z" />
+    <path
+        android:fillColor="#3FD68F"
+        android:pathData="M58,28h22v22h-22z" />
+    <path
+        android:fillColor="#E6B450"
+        android:pathData="M28,58h22v22h-22z" />
+    <path
+        android:fillColor="#E5534B"
+        android:pathData="M58,58h22v22h-22z" />
+</vector>
